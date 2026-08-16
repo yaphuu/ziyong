@@ -1,0 +1,84 @@
+#!/bin/bash
+# webwatch.sh - read-only nginx access monitor
+# Requires: tail, awk, sed, grep, mmdbinspect, jq
+# GeoIP databases: /usr/share/GeoIP/GeoLite2-City.mmdb and GeoLite2-ASN.mmdb
+
+LOG="${LOG:-/var/log/nginx/access.log}"
+CITY_DB="${CITY_DB:-/usr/share/GeoIP/GeoLite2-City.mmdb}"
+ASN_DB="${ASN_DB:-/usr/share/GeoIP/GeoLite2-ASN.mmdb}"
+CACHE="${CACHE:-/var/lib/webwatch/ip-cache}"
+mkdir -p "$CACHE"
+
+command -v mmdbinspect >/dev/null 2>&1 || { echo "ERROR: mmdbinspect not found"; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "ERROR: jq not found"; exit 1; }
+
+geo() {
+    local ip="$1" c a
+    c="$(mmdbinspect -db "$CITY_DB" "$ip" 2>/dev/null |
+        jq -r '.[].Records[].Record | [.country.names["zh-CN"], (.subdivisions[0].names["zh-CN"] // ""), (.city.names["zh-CN"] // "")] | join("/")' 2>/dev/null |
+        head -n1)"
+    a="$(mmdbinspect -db "$ASN_DB" "$ip" 2>/dev/null |
+        jq -r '.[].Records[].Record | ["AS" + (.autonomous_system_number|tostring), (.autonomous_system_organization // "")] | join(" / ")' 2>/dev/null |
+        head -n1)"
+    printf '%s|%s' "${c:-未知}" "${a:-未知}"
+}
+
+echo "============================================================"
+echo " WebWatch - nginx realtime security observer"
+echo " Log: $LOG"
+echo " Started: $(date '+%F %T')"
+echo " ============================================================"
+
+tail -Fn0 "$LOG" | while IFS= read -r line; do
+    # Expected log format from this VPS:
+    # ... "$request" ... "$http_x_forwarded_for"
+    first="$(awk '{print $1}' <<<"$line")"
+    last="$(awk '{print $NF}' <<<"$line" | tr -d '"')"
+
+    if [[ "$last" =~ ^[0-9a-fA-F:.]+$ ]]; then
+        ip="$last"
+        proxy="$first"
+    else
+        ip="$first"
+        proxy="-"
+    fi
+
+    [[ "$ip" == "-" ]] && continue
+    [[ "$ip" == "127.0.0.1" || "$ip" == "::1" ]] && continue
+
+    request="$(sed -n 's/.*"\(GET\|POST\|HEAD\|PUT\|DELETE\|OPTIONS\|PATCH\) \([^"]*\) HTTP\/[^"]*".*/\1 \2/p' <<<"$line")"
+    status="$(awk '{for(i=1;i<=NF;i++) if($i ~ /^[1-5][0-9][0-9]$/){print $i; exit}}' <<<"$line")"
+    ua="$(sed -n 's/.*"\([^"]*\)"[[:space:]]*$/\1/p' <<<"$line")"
+
+    risk="🟢 NORMAL"
+    reason=""
+
+    if grep -Eqi \
+      '(\.git([/?]|$)|(^|[/?])\.env([/?]|$)|wp-login\.php|xmlrpc\.php|wp-admin|wp-includes|phpmyadmin|phpinfo|actuator([/?]|$)|cgi-bin|eval-stdin|/bin/sh|/bin/bash|%2e|%252e|%2f|%252f|/etc/passwd|/proc/self|jndi:|union([+%20]|%20)+select|select.+from)' <<<"$request"; then
+        risk="🔴 HIGH"
+        reason="典型漏洞/后门/敏感文件探测"
+    elif [[ "$status" == "400" || "$status" == "401" || "$status" == "403" || "$status" == "404" ]]; then
+        risk="🟡 WATCH"
+        reason="异常/不存在资源请求"
+    fi
+
+    key="$(printf '%s' "$ip" | tr ':' '_')"
+    cachefile="$CACHE/$key"
+    if [ ! -s "$cachefile" ]; then
+        geo "$ip" > "$cachefile"
+    fi
+    geo_info="$(<"$cachefile")"
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "$(date '+%F %T')  $risk"
+    echo "真实IP : $ip"
+    echo "代理IP : $proxy"
+    echo "归属地 : ${geo_info%%|*}"
+    echo "ASN    : ${geo_info#*|}"
+    echo "请求   : ${request:-unknown}"
+    echo "状态   : ${status:-unknown}"
+    [ -n "$reason" ] && echo "原因   : $reason"
+    [ -n "$ua" ] && echo "UA     
+: $ua"
+done
